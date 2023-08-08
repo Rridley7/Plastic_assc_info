@@ -1,0 +1,56 @@
+restart-times: 0
+keep-going: True
+rerun-incomplete: True
+fasterq-dump: /storage/coda1/p-ktk3/0/rridley3/dir/sra-toolkit/sratoolkit.3.0.2-centos_linux64/bin/fasterq-dump
+data-file: /storage/home/hcoda1/6/rridley3/scratch/14_biofilm_reads/S62_prep_file.pqt
+study-file: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/05_prep_files/study_mapping_setup.pq
+out_dir: results
+scratch_dir: /storage/home/hcoda1/6/rridley3/scratch/14_biofilm_reads/temp_files
+study_scratch: /storage/home/hcoda1/6/rridley3/scratch/08_study_mapping/temp_files
+se_scratch: /storage/home/hcoda1/6/rridley3/scratch/09_single_stu_mapping/temp_files
+group_range: [34,38] #34-38 are groups, 38 is long
+
+bins:
+  01_set: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/01_all_drep_genomes/01_all_genomes
+  02_unbin: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/02_unbin_contigs/02_unbin_contigs
+genes:
+  01_set: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/03_all_binned_genes/03_nr_binned_genes
+  02_unbin: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/04_unbin_genes/04_unbin_genes
+
+fa-bins:
+  01_set: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/01_all_drep_genomes/05_all_drep_genomes_ref.fna
+  02_unbin: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/02_unbin_contigs/05_unbin_nr_contigs.fa
+fa-genes:
+  01_set: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/03_all_binned_genes/all_study_nr_genes_rep_seq.fasta
+  02_unbin: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/04_unbin_genes/unbinned_nr_genes_rep_seq.fasta
+
+gff_files:
+  01_set: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/00_gffs/01_set_genome_cds.gff3
+  02_unbin: /storage/home/hcoda1/6/rridley3/scratch/01_map_refs/00_gffs/02_unbin_nr_contigs.gff3
+
+coverm:
+  trim_min: 10
+  trim_max: 90
+  min_id: 0.95
+  min_aln: 0.7
+  add_params: ' '
+
+fastp:
+  add_params: ' '
+mem_per_cpu:
+  high_max: 25
+  high_top: 23
+  high_extra: 20
+  high: 15
+  med_high: 10
+  med: 8
+  med_low: 5
+  low: 4
+threads:
+  high: 24
+  med: 16
+  low: 8
+
+microbe_census:
+  n: 100000000
+  q: 10

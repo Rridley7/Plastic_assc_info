@@ -1,0 +1,102 @@
+default-resources:
+  - mem_gb=80
+  - runtime="24:00:00"
+restart-times: 2
+out_dir: results
+latency-wait: 60
+use-conda: True
+jobs: 100
+keep-going: True
+study_range: [1,16]
+rerun-incomplete: True
+a_type: ['idb','spa']
+t_type: ['t','n'] '#p'
+binners: ['mxb','mtb', 'ros']
+
+min_contig: 1000
+scratch_dir: /storage/home/hcoda1/6/rridley3/scratch
+samples: /Users/rodney/Data/Coding_Programs/snakemake_test2/test_files.csv      # /storage/home/hcoda1/6/rridley3/scratch/subset_2/study_files.csv
+# /Users/rodney/Data/Coding_Programs/snakemake_test2/test_files.csv
+feature_counts:
+  bin: /storage/home/hcoda1/6/rridley3/shared3/apps/featureCounts
+
+fastp:
+  memgb: 16
+  add_params: ' '
+quast:
+  add_params: ' '
+  max_ref: 0
+
+mem_per_cpu:
+  high_max: 25
+  high_top: 23
+  high_extra: 20
+  high: 15
+  med_high: 10
+  med: 8
+  med_low: 5
+  low: 4
+threads:
+  high: 24
+  med: 16
+  low: 8
+idba:
+  t: 36
+  maxk: 140
+  idba_bin: /storage/home/hcoda1/6/rridley3/data/dir/idba/bin/
+  mem_per_cpu: 15
+megahit:
+  add_params: ' '
+bbtools_bin: "/storage/home/hcoda1/6/rridley3/data/dir/bbmap"
+map:
+  stype: 11
+  comp: 9
+  map_type: 'map-hifi'
+maxbin:
+  bin: /storage/home/hcoda1/6/rridley3/.conda/envs/metawrap-env/bin/
+metabat:
+  bin: /storage/home/hcoda1/9/rconrad6/p-ktk3-0/apps/metabat
+coverm:
+  ext: fa
+  min_id: 95
+  trim_min: 10
+  trim_max: 90
+  add_params: ' '
+mmseqs:
+  min_seq_id: 0.98
+  c: 0.8
+  s: 4
+  add_params: ' '
+
+eggnog:
+  method: diamond
+drep:
+  S_ani: 0.965
+  S_algorithm: fastANI
+  comp: 50
+  con: 15
+
+classify_gtdb:
+  ext: gz
+  dbpath: /storage/home/hcoda1/6/rridley3/data/dir/databases/gtdb_r207_v2
+fastaai:
+  add_params: --verbose
+microbe_census:
+  n: 100000000
+  q: 10
+nonpareil:
+  T: kmer
+dbcan:
+  db: /storage/home/hcoda1/6/rridley3/data/dir/databases/dbcan_db
+simka:
+  makefigs: /storage/home/hcoda1/9/rconrad6/p-ktk3-0/apps/simka-v1.5.3/scripts/visualization/run-visualization.py
+  max_reads: 100000000
+  extra_params: -simple-dist -complex-dist
+  figure_params:  -heatmap -pca -tree -format pdf
+kraken:
+  kraken_db: /storage/home/hcoda1/6/rridley3/shared3/clean_water_services/99_kraken2_db
+bracken:
+  levels: S G C
+bakta:
+  db: /storage/home/hcoda1/6/rridley3/shared3/DB/bakta/db
+  add_params: -v

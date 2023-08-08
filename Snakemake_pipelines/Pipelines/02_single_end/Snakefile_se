@@ -1,0 +1,1737 @@
+import os
+import gzip
+import glob
+from collections import defaultdict
+from functools import partial
+import fileinput
+from pytools.persistent_dict import PersistentDict
+import pandas as pd
+from Bio import SeqIO
+
+
+configfile: "/storage/home/hcoda1/6/rridley3/scratch/04_pls_part4_se/config_se.yaml"
+# "/storage/home/hcoda1/6/rridley3/scratch/subset_3/config.yaml"
+
+localrules: all, setup_files, multiqc, simka_prep, krona_plot, collect_geqs, drep_prep
+study_range = config['study_range'] # ENSURE CORRECT STUDY RANGE
+id_list = ['S' + str(x).zfill(2) for x in list(range(int(study_range[0]),int(study_range[1])+1))]
+
+in_df = pd.read_csv(config['samples'])
+df = in_df.query('unneeded == False and read_type == "single" and seq_type == "metagenome" and StudyID in '
+                 '@id_list').set_index("SampleID",drop=False).astype(str)
+#df = pd.read_csv(config['samples']).set_index("SampleID",drop=False).astype(str) # For local
+print(f"Run for set {sorted(list(set(df['StudyID'])))}")
+
+SAMPLES = list(df['SampleID'])
+GROUPS = list(df['StudyID'])
+GROUP_IDS = list(set(df['StudyID']))
+study_group_items = dict(zip(df.SampleID,df.StudyID)).items()
+binners = config['binners']
+a_type = config['a_type']
+t_type = config['t_type']
+
+samples_in_group = defaultdict(list)
+for item_s in list(zip(df.SampleID,df.StudyID)):
+    samples_in_group[item_s[1]].append(item_s[0])
+
+out_name = config['out_dir']
+temp_scratch_dir= str(config['scratch_dir']).strip() + '/smk_temp'
+
+
+def is_gz_file(filepath):
+    with open(filepath,'rb') as test_f:
+        return test_f.read(2) == b'\x1f\x8b'
+def open_file(file):
+    encoding = is_gz_file(file)
+    _open = partial(gzip.open,mode='rt') if encoding else open
+    return _open(file)
+
+
+def get_threads(level='high'):
+    return int(config['threads'][level])
+def get_mem_cpu(level):
+    return int(config['mem_per_cpu'][level])
+def get_mem_mb(mem_level,thread_level='high'):
+    return int(config['mem_per_cpu'][mem_level] * config['threads'][thread_level] * 1000)
+
+def get_mem2_cpu(wildcards, attempt):
+    level_dict =  { 1 : 'med', 2 : 'high', 3 : 'high_extra'}
+    return get_mem_cpu(level_dict[attempt])
+def get_mem2_mb(wildcards, attempt):
+    level_dict =  { 1 : 'med', 2 : 'high', 3 : 'high_extra'}
+    return get_mem_mb(mem_level=level_dict[attempt])
+def get_assem_cpu(wildcards, attempt):
+    level_dict =  { 1 : 'high', 2 : 'high_extra', 3 : 'high_top'}
+    return get_mem_cpu(level_dict[attempt])
+def get_assem_time(wildcards,attempt):
+    time_level =  { 1 : '48:00:00', 2 : '56:00:00', 3 : '64:00:00'}
+    return time_level[attempt]
+def get_assem_mb(wildcards, attempt):
+    level_dict =  { 1 : 'high', 2 : 'high_extra', 3 : 'high_top'}
+    return get_mem_mb(mem_level=level_dict[attempt])
+def get_assem_idb_cpu(wildcards, attempt):
+    level_dict =  { 1 : 'high_extra', 2 : 'high_top', 3 : 'high_max'}
+    return get_mem_cpu(level_dict[attempt])
+def get_assem_idb_mb(wildcards, attempt):
+    level_dict =  { 1 : 'high_extra', 2 : 'high_top', 3 : 'high_max'}
+    return get_mem_mb(mem_level=level_dict[attempt])
+def if_spades_cleanup(a_type):
+    if 'spa' in a_type:
+        return [expand(f"{out_name}/temp/touchfiles/{{group}}/03_assembly/{{sample}}-spa_{{t_type}}-cleanup.touch",
+                                        t_type=t_type,sample=key,group=value) for key,value in study_group_items]
+    else:
+        return ''
+def if_simka_all(group_ids):
+    if len(group_ids) > 1:
+        return f"{out_name}/temp/touchfiles/study_analysis/simka_all.touch",
+    else:
+        return ''
+
+
+rule all:
+    input:
+        # Assembly
+        assembly_touch = ancient([expand(f"{out_name}/temp/touchfiles/{{group}}/03_assembly/"
+                                         f"{{sample}}-{{a_type}}-{{t_type}}-assm.touch",sample=key,group=value,
+                                        a_type=a_type,t_type=t_type) for key, value in study_group_items]),
+        rename_touch = ancient([expand(f"{out_name}/temp/touchfiles/{{group}}/03_assembly/rename--{{sample}}--"
+                                       f"{{a_type}}_{{t_type}}.touch", sample=key,group=value,a_type=a_type,
+                                        t_type=t_type) for key, value in study_group_items]),
+        quast_touch= ancient(expand(f"{out_name}/temp/touchfiles/quast_{{group}}.touch",group=GROUP_IDS)),
+        cram_touch = ancient([expand(f"{out_name}/temp/touchfiles/{{group}}/04_mapped/{{sample}}_{{a_type}}_"
+                                     f"{{t_type}}_cram.touch",sample=key,group=value,
+                                        a_type=a_type,t_type=t_type) for key, value in study_group_items]),
+
+
+        # Binning
+        bin_touch = ancient([expand(f"{out_name}/temp/touchfiles/{{group}}/05_binned/{{sample}}_{{binner}}_"
+                                    f"{{a_type}}_{{t_type}}_bin.touch",sample=key,group=value,a_type=a_type,
+                                    t_type=t_type,binner=binners) for key, value in study_group_items]),
+        das_tool_touch = ancient([expand(f"{out_name}/temp/touchfiles/{{group}}/05_binned/{{sample}}_{{a_type}}_"
+                                        f"{{t_type}}_dt.touch",sample=key,group=value,a_type=a_type,t_type=t_type)
+                                for key,value in study_group_items]),
+        drep_sample_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/06_mags/sample-{{sample}}_drep.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+        drep_group_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/06_mags/group-{{group}}_drep.touch",
+                                        group = GROUPS)),
+        multiqc_touch = ancient(expand(f"{out_name}/temp/touchfiles/multiqc-{{group}}.touch", group=GROUP_IDS)),
+        checkm_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/06_mags/sample-{{sample}}_checkm.touch",
+                                zip,sample=SAMPLES,group=GROUPS)),
+
+        # Classification
+        gtdb_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/06_mags/{{sample}}_gtdb.touch",
+                                    zip, group=GROUPS, sample=SAMPLES)),
+        gtdb_log =  ancient(expand(f"{out_name}/{{group}}/reports/group-drep.log",group=GROUPS)),
+        coverm_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/07_mag_analysis/{{group}}_coverm.touch",
+                                    group = GROUPS)),
+
+
+        # Annotation
+        bakta_bin_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_bakta_annot.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+        bakta_unbin_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_bakta.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+        eggnog_binned= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/binned_{{sample}}_eggnog.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+        eggnog_unbinned= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_eggnog.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+        dbcan_binned= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/binned_{{sample}}_dbcan.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+        dbcan_unbinned= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_dbcan.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+
+        all_genes_file= ancient(f"{out_name}/temp/touchfiles/get_all_genes.touch"),
+        unbin_genes_touch= ancient(f"{out_name}/temp/touchfiles/get_unbin_genes.touch"),
+        unbinned_contig_tch= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_unbinned.touch",
+                                        zip,sample=SAMPLES,group=GROUPS)),
+
+        # Feature Counts
+        fc_group_touch= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/fc_{{group}}.touch",
+            group=GROUPS)),
+        fc_sample_touch= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/fc_sample/binned/fc-{{sample}}.touch",zip,
+            group=GROUPS,sample=SAMPLES)),
+        fc_unbinned_touch= ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/fc_sample/unbin/fc-{{sample}}.touch",zip,
+            group=GROUPS,sample=SAMPLES)),
+
+        # Diversity
+        geqs = ancient(expand(f"{out_name}/{{group}}/02_diversity/microbe_census/{{sample}}.geq.txt",zip,
+                                sample=SAMPLES, group=GROUPS)),
+        geqs_for_study = ancient(f"{out_name}/temp/touchfiles/study_geqs.touch"),
+        nonpareil_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/diversity/{{sample}}_np.touch",zip,
+                                        sample=SAMPLES, group=GROUPS)),
+        collect_np_touch = ancient(f"{out_name}/temp/touchfiles/np_collect.touch"),
+
+        simka_prep = ancient(expand(f"{out_name}/{{group}}/02_diversity/info/prep-{{group}}-simka.txt",group=GROUP_IDS)),
+        simka_group_log = ancient(expand(f"{out_name}/{{group}}/02_diversity/info/simka_log.txt",group=GROUPS)),
+        # simka_all = ancient(f"{out_name}/temp/touchfiles/study_analysis/simka_all.touch"),
+
+
+        bracken_log = ancient(expand(f"{out_name}/{{group}}/02_diversity/kraken2/{{sample}}.blog",zip,
+                                sample=SAMPLES, group=GROUPS)),
+        krona_html = ancient(expand(f"{out_name}/{{group}}/02_diversity/kraken2/diversity_krona.html",group=GROUP_IDS)),
+
+
+        # Group Analysis
+        #fastani_touch = ancient(f"{out_name}/temp/touchfiles/gANI.touch"),
+        #fastaai_touch = ancient(f"{out_name}/temp/touchfiles/gAAI.touch"),
+
+
+
+rule setup_files:
+    input:
+        f1 = lambda wildcards: ancient(df.loc[wildcards.sample, 'Read1']),
+    output:
+        temp_dir = directory(f"{temp_scratch_dir}/{{group}}/{{sample}}"),
+        setup_done = touch(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_setup.touch")
+    threads: get_threads('low')
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low',thread_level='low')
+    params:
+        raw_dir = f"{out_name}/{{group}}/00_raw_reads/",
+        read1 = f"{out_name}/{{group}}/00_raw_reads/{{sample}}.fq.gz",
+    run:
+        if str(input.f1).endswith('gz'):
+            shell("""
+            mkdir -p {params.raw_dir}
+            echo "Setting up the file directory"
+            cp {input.f1} {params.read1}
+            mkdir -p {output.temp_dir}
+            """)
+        else:
+            shell("""
+            mkdir -p {params.raw_dir}
+            echo "Setting up the file directory"
+            pigz -k {input.f1} ; mv {input.f1}.gz {params.read1}
+            mkdir -p {output.temp_dir}
+            """)
+
+rule fastp:
+    input:
+        setup_done = ancient(rules.setup_files.output.setup_done),
+    output:
+        trim1=f"{out_name}/{{group}}/01_trimmed/{{sample}}-t.fq.gz",
+        html=f"{out_name}/{{group}}/reports/{{sample}}-fastp.html",
+        json=f"{out_name}/{{group}}/reports/{{sample}}-fastp.json",
+        trim_done= touch(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_trim.touch")
+    threads: get_threads('med')
+    conda: "analysis_db"
+    resources:
+        mem_per_cpu = get_mem_cpu('med'),
+        mem_mb = get_mem_mb(mem_level='med',thread_level='med')
+    log:
+        f"{out_name}/{{group}}/reports/{{sample}}-fastp.log"
+    params:
+        add_params = config['fastp']['add_params'],
+        read1 = rules.setup_files.params.read1,
+    shell:"""
+    fastp -i {params.read1} -o {output.trim1} \
+    {params.add_params} -h {output.html} -j {output.json} &> {log}
+    rm {params.read1} 
+    """
+
+rule bbnorm:
+    input:
+        trim1 = ancient(rules.fastp.output.trim1),
+    output:
+        norm1 = f"{out_name}/{{group}}/01_trimmed/{{sample}}-n.fq.gz",
+        norm_done= touch(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_norm.touch")
+    threads: 24
+    resources:
+        time ="12:00:00",
+        mem_per_cpu= get_mem2_cpu,
+        mem_mb= get_mem2_mb,
+    params:
+        bbtools_bin = config['bbtools_bin']
+    shell:"""
+    {params.bbtools_bin}/bbnorm.sh in={input.trim1} out={output.norm1}
+    """
+def size_dep_mb(wildcards,input,attempt):
+    if float((os.stat(input.read1).st_size) / (1024 ** 3)) > 2.45:
+        return get_assem_idb_mb(wildcards,attempt)
+    else:
+        return get_assem_mb(wildcards,attempt)
+def size_dep_cpu(wildcards,input,attempt):
+    if float((os.stat(input.read1).st_size) / (1024 ** 3)) > 2.45:
+        return get_assem_idb_cpu(wildcards,attempt)
+    else:
+        return get_assem_cpu(wildcards,attempt)
+
+
+if 'idb' in a_type:
+    rule idba_ud:
+        input:
+            read1=ancient(f"{out_name}/{{group}}/01_trimmed/{{sample}}-{{t_type}}.fq.gz"),
+        output:
+            contigs =f"{out_name}/{{group}}/03_assembly/{{sample}}/idb_{{t_type}}/{{sample}}_idb_{{t_type}}_contigs.fa.gz",
+            idb_done_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/03_assembly/{{sample}}-idb-{{t_type}}-assm.touch")
+        log: f"{out_name}/{{group}}/03_assembly/{{sample}}/idb_{{t_type}}/{{sample}}_idb_{{t_type}}.log"
+        threads: get_threads()
+        conda: "analysis_db"
+        resources:
+            time = get_assem_time,
+            mem_per_cpu =  lambda wildcards,input,attempt: size_dep_cpu(wildcards,input,attempt),
+            mem_mb = lambda wildcards,input,attempt: size_dep_mb(wildcards,input,attempt)
+        params:
+            maxk = config['idba']['maxk'],
+            min_contig= config['min_contig'],
+            outdir = f"{out_name}/{{group}}/03_assembly/{{sample}}/idb_{{t_type}}",
+            idba_bin = config['idba']['idba_bin'],
+            tmpdir = f"{temp_scratch_dir}/{{group}}/assembly_{{t_type}}",
+            prefix = f"{{sample}}-{{t_type}}",
+            bbtools_bin= config['bbtools_bin']
+        shell:
+            """
+            #Unzip files 
+            rm -r {params.outdir} &> /dev/null || true 
+            mkdir -p {params.outdir} {params.tmpdir}
+
+            
+            pigz -dc {input.read1} > {params.tmpdir}/{params.prefix}.fq
+
+
+            # Merge reads
+            {params.idba_bin}/fq2fa  {params.tmpdir}/{params.prefix}.fq \
+            {params.tmpdir}/{params.prefix}.fa
+            
+            rm {params.tmpdir}/{params.prefix}.fq 
+
+            # Run IDBA_UD
+            {params.idba_bin}/idba_ud -l {params.tmpdir}/{params.prefix}.fa -o {params.outdir} --num_threads {threads} \
+            --maxk {params.maxk}  --min_contig {params.min_contig}  || true
+        
+            if [[ ! -e "{params.outdir}/contig-140.fa" ]] 
+            then
+            exit 1
+            fi 
+            # Using max contig bc other file may not be fully written
+            mv {params.outdir}/contig-140.fa {params.outdir}/contig.fa  
+
+
+            rm {params.outdir}/*-* {params.outdir}/kmer {params.tmpdir}/{params.prefix}.fa || true
+            
+            {params.bbtools_bin}/reformat.sh in={params.outdir}/contig.fa out={output.contigs} \
+            minlength={params.min_contig}
+            
+            for x in {params.outdir}/*.fa* ; do pigz ${{x}} || true ; done
+            
+            
+            """
+
+
+if 'mgt' in a_type:
+    rule megahit:
+        input:
+            read1=ancient(f"{out_name}/{{group}}/01_trimmed/{{sample}}-{{t_type}}.fq.gz"),
+        output:
+            mgt_done_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/03_assembly/{{sample}}-mgt-{{t_type}}-assm.touch"),
+            assembly = f"{out_name}/{{group}}/03_assembly/{{sample}}/mgt_{{t_type}}/{{sample}}_mgt_{{t_type}}_contigs.fa.gz",
+        log: f"{out_name}/{{group}}/03_assembly/{{sample}}/mgt_{{t_type}}/{{sample}}_mgt_{{t_type}}.log"
+        threads: get_threads()
+        conda: "megahit"
+        resources:
+            mem_per_cpu =  get_assem_cpu,
+            mem_mb = get_assem_mb,
+            time = get_assem_time,
+            att_no =  lambda wildcards,attempt: attempt
+        params:
+            min_contig = config['min_contig'],
+            add_params = config['megahit']['add_params'],
+            outdir = f"{out_name}/{{group}}/03_assembly/{{sample}}/mgt_{{t_type}}",
+            prefix = f"{{sample}}_mgt_{{t_type}}",
+            assm_name = f"{{sample}}_mgt_{{t_type}}.contigs.fa.gz"
+
+        shell:
+             """
+             if [[ {resources.att_no} -eq 1 ]] && [[ ! -e {params.outdir}/{params.prefix}.log ]] && \
+             [[ ! -e {params.outdir}/checkpoints.txt ]]
+             then 
+             
+             rm -r {params.outdir} &> /dev/null || true 
+             
+             megahit -r {input.read1} -o {params.outdir} --out-prefix {params.prefix} --min-contig-len {params.min_contig} \
+             -t {threads} {params.add_params}
+             
+             else
+             megahit  --continue -o {params.outdir}
+             fi
+             
+             rm -r {params.outdir}/intermediate_contigs || true
+             
+             for x in {params.outdir}/*.fa* ; do pigz ${{x}} || true ; done
+             mv {params.outdir}/{params.assm_name} {output.assembly}
+             
+             
+             """
+
+
+
+rule rename_contigs:
+    input:
+        assembly = ancient(f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/{{sample}}_{{a_type}}_{{t_type}}_contigs.fa.gz")
+    output:
+        rn_done_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/03_assembly/rename--{{sample}}--{{a_type}}_{{t_type}}.touch"),
+        rename_log = f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/rename_log.txt"
+    run:
+        temp_file = f"{input.assembly}.temp"
+        id_out = f"{wildcards.a_type}-{wildcards.t_type}-{wildcards.sample}"
+        already_processed = False
+        with gzip.open(input.assembly,'rt') as in_file, gzip.open(temp_file,'wt') as out_file, \
+                open(output.rename_log,'a') as log_file:
+            log_file.write("Read_Name,Previous_Name")
+            contig_count = 0
+            for title,read in SeqIO.FastaIO.SimpleFastaParser(in_file):
+                if f'-{wildcards.a_type}-' in title:
+                    print("This file has already been processed.")
+                    already_processed = True
+                    break
+                elif wildcards.a_type == 'mgt':
+                    contig_count += 1
+                    read_id = f"contig-{contig_count}-{id_out}"
+                    out_file.write(f">{read_id}\n{read}\n")
+                    log_file.write(f"\n{read_id},{title}")
+                elif wildcards.a_type == 'idb':
+                    read_id = f"{title.split(' ')[0]}-{id_out}"
+                    out_file.write(f">{read_id}\n{read}\n")
+                    log_file.write(f"\n{read_id},{title}")
+        if not already_processed:
+            os.replace(temp_file,input.assembly)
+rule metaquast:
+    input:
+        contigs= lambda wildcards: ancient(expand(f"{out_name}/{wildcards.group}/03_assembly/{{sample}}/{{a_type}}_"
+                                                  f"{{t_type}}/{{sample}}_{{a_type}}_{{t_type}}_contigs.fa.gz",
+                                            sample=samples_in_group[wildcards.group], a_type=a_type, t_type=t_type)),
+        rn_touch= lambda wildcards: ancient(expand(f"{out_name}/temp/touchfiles/{wildcards.group}/03_assembly/"
+                                  f"rename--{{sample}}--{{a_type}}_{{t_type}}.touch",
+                                            sample=samples_in_group[wildcards.group],a_type=a_type,t_type=t_type))
+    output:
+        out_dir = directory(f"{out_name}/reports/quast_{{group}}"),
+        qst_done_touch = touch(f"{out_name}/temp/touchfiles/quast_{{group}}.touch"),
+    threads: get_threads()
+    conda: "analysis_db"
+    resources:
+        time ="36:00:00",
+        mem_per_cpu= get_mem_cpu('med'),
+        mem_mb= get_mem_mb(mem_level='med',thread_level='high'),
+    params:
+        add_params = config['quast']['add_params'],
+        max_ref = config['quast']['max_ref']
+    shell:
+        """
+        
+        metaquast.py -o  {output.out_dir} --threads {threads} --max-ref-number {params.max_ref} --no-icarus \
+        {input.contigs}  
+        multiqc {output.out_dir} -o {output.out_dir}/qc {params.add_params}
+        
+        rm -r {output.out_dir}/quast_downloaded_references {output.out_dir}/quast_corrected_input \
+        {output.out_dir}/krona_charts || true
+        """
+
+
+rule bwa_map:
+     input:
+        raw1 =ancient(rules.fastp.output.trim1),
+        assembly =ancient(f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/{{sample}}_{{a_type}}_{{t_type}}_contigs.fa.gz"),
+        rn_touch = ancient(rules.rename_contigs.output.rn_done_touch)
+     output:
+        bamfile = f"{out_name}/{{group}}/04_mapped/{{sample}}/{{sample}}_{{a_type}}_{{t_type}}.bam",
+        idxstats = f"{out_name}/{{group}}/04_mapped/{{sample}}/{{sample}}_{{a_type}}_{{t_type}}.idxstats",
+        avg_coverage = f"{out_name}/{{group}}/04_mapped/{{sample}}/{{sample}}_{{a_type}}_{{t_type}}_avg_cov.txt",
+        mtb_coverage = f"{out_name}/{{group}}/04_mapped/{{sample}}/{{sample}}_{{a_type}}_{{t_type}}_mtb_cov.txt",
+        bwa_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/04_mapped/{{sample}}_{{a_type}}_{{t_type}}_bam.touch")
+     threads: get_threads()
+     conda: "coverm"
+     resources:
+        mem_per_cpu = get_mem_cpu('med'),
+        mem_mb = get_mem_mb(mem_level='med'),
+        time = "12:00:00"
+     params:
+        stype = config['bwa_map']['stype'],
+        comp=config['bwa_map']['comp'],
+        outdir=f"{out_name}/{{group}}/04_mapped/{{sample}}",
+        PREFIX="{sample}_{a_type}_{t_type}"
+     shell:
+        """
+        #Clean up prior to mapping
+        bwa-mem2 index -p {params.outdir}/{params.PREFIX} {input.assembly}
+        bwa-mem2 mem -t {threads} {params.outdir}/{params.PREFIX} {input.raw1} | \
+        samtools sort -l {params.comp} -@ {threads} -o {output.bamfile} -
+        samtools index -@ {threads}  {output.bamfile} 
+        samtools idxstats  {output.bamfile} > {output.idxstats}
+        coverm contig -b {output.bamfile} -m metabat -o {output.mtb_coverage}
+        coverm contig -b {output.bamfile} -o {params.outdir}/{params.PREFIX}.temp.cov
+        tail -n+2 {params.outdir}/{params.PREFIX}.temp.cov > {output.avg_coverage}
+        rm {params.outdir}/{params.PREFIX}.temp.cov {params.outdir}/{params.PREFIX}.0123 \
+        {params.outdir}/{params.PREFIX}.amb {params.outdir}/{params.PREFIX}.ann {params.outdir}/{params.PREFIX}*2bit.64
+        """
+
+
+
+
+
+rule multiqc:
+    input:
+        quast_dir = ancient(f"{out_name}/reports/quast_{{group}}"),
+        map_files = lambda wildcards: ancient(expand(f"{out_name}/{{group}}/04_mapped/{{sample}}/{{sample}}_{{a_type}}_{{t_type}}.idxstats",
+                            sample=samples_in_group[wildcards.group],group=wildcards.group,a_type=a_type,t_type=t_type))
+    output:
+        touch(f"{out_name}/temp/touchfiles/multiqc-{{group}}.touch"),
+        qc = directory(f"{out_name}/reports/multiqc/{{group}}"),
+    conda: "analysis_db"
+    threads: get_threads('low')
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low',thread_level='low')
+    params:
+        group_dir = f"{out_name}/{{group}}",
+        parent_dir = f"{out_name}/reports/multiqc"
+    shell:"""
+    mkdir -p  {params.parent_dir}
+    multiqc $(find {input.quast_dir} -name 'report.tsv' | tr '\n' ' ' ) \
+    $(find {params.group_dir} -name '*fastp.json' | tr '\n' ' ' ) \
+    $(find {params.group_dir} -name '*.summary' | tr '\n' ' ' ) \
+    $(find {params.group_dir} -name '*.k2' | tr '\n' ' ' ) \
+    -o {output.qc}
+    """
+
+if 'mxb' in binners:
+    rule maxbin:
+        input:
+            contigs=ancient(f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/"
+                            f"{{sample}}_{{a_type}}_{{t_type}}_contigs.fa.gz"),
+            assm_cov = ancient(rules.bwa_map.output.avg_coverage),
+            rn_touch = ancient(rules.rename_contigs.output.rn_done_touch)
+        output: touch(f"{out_name}/temp/touchfiles/{{group}}/05_binned/{{sample}}_mxb_{{a_type}}_{{t_type}}_bin.touch"),
+            out_dir = directory(f"{out_name}/{{group}}/05_binned/{{sample}}/{{sample}}_mxb_{{a_type}}_{{t_type}}")
+        log: f"{out_name}/{{group}}/05_binned/logs/{{sample}}_mxb_{{a_type}}_{{t_type}}_log.txt"
+        threads: get_threads('high')
+        conda: "maxbin2"
+        resources:
+            mem_per_cpu = get_mem_cpu('low'),
+            mem_mb = get_mem_mb(mem_level='low'),
+            time = "20:00:00"
+        params:
+            out_prefix = f"{out_name}/{{group}}/05_binned/{{sample}}/{{sample}}_mxb_{{a_type}}_{{t_type}}/"
+                         f"{{sample}}_mxb_{{a_type}}_{{t_type}}",
+        shell:
+            """
+            set +o pipefail
+            mkdir -p {output.out_dir}
+            run_MaxBin.pl -contig {input.contigs} -abund {input.assm_cov} \
+            -out {params.out_prefix} -thread {threads} >> {log} || true
+            
+            rename .fasta .fa {output.out_dir}/*.fasta || true 
+
+            """
+if 'mtb' in binners:
+    rule metabat:
+        input:
+            contigs=ancient(f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/{{sample}}_{{a_type}}_{{t_type}}_contigs.fa.gz"),
+            cov_file = ancient(rules.bwa_map.output.mtb_coverage),
+            rn_touch= ancient(rules.rename_contigs.output.rn_done_touch),
+        output:
+            touch(f"{out_name}/temp/touchfiles/{{group}}/05_binned/{{sample}}_mtb_{{a_type}}_{{t_type}}_bin.touch"),
+            out_dir = directory(f"{out_name}/{{group}}/05_binned/{{sample}}/{{sample}}_mtb_{{a_type}}_{{t_type}}")
+        log: f"{out_name}/{{group}}/05_binned/logs/{{sample}}_mtb_{{a_type}}_{{t_type}}_log.txt"
+        threads: get_threads()
+        conda: "analysis_db"
+        resources:
+            mem_per_cpu=get_mem_cpu('med'),
+            mem_mb=get_mem_mb(mem_level='med'),
+            time = "36:00:00"
+        params:
+            out_prefix = f"{out_name}/{{group}}/05_binned/{{sample}}/{{sample}}_mtb_{{a_type}}_{{t_type}}/"
+                         f"{{sample}}_mtb_{{a_type}}_{{t_type}}",
+            bin = config['metabat']['bin']
+        shell:
+            """
+            mkdir -p {output.out_dir}
+            
+            {params.bin}/metabat2 -i {input.contigs} -a {input.cov_file} -o {params.out_prefix} | tee -a {log} || true
+            """
+
+if 'ros' in binners:
+    rule rosella:
+        input:
+            contigs=ancient(f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/"
+                            f"{{sample}}_{{a_type}}_{{t_type}}_contigs.fa.gz"),
+            cov_file=ancient(rules.bwa_map.output.mtb_coverage),
+            rn_touch=ancient(rules.rename_contigs.output.rn_done_touch),
+        output:
+            touch(f"{out_name}/temp/touchfiles/{{group}}/05_binned/{{sample}}_ros_{{a_type}}_{{t_type}}_bin.touch"),
+            out_dir=directory(f"{out_name}/{{group}}/05_binned/{{sample}}/{{sample}}_ros_{{a_type}}_{{t_type}}")
+        log: f"{out_name}/{{group}}/05_binned/logs/{{sample}}_ros_{{a_type}}_{{t_type}}_log.txt"
+        threads: get_threads()
+        conda: "rosella"
+        resources:
+            mem_per_cpu=get_mem_cpu('med'),
+            mem_mb=get_mem_mb(mem_level='med'),
+            time="24:00:00"
+        params:
+            parent_dir = f"{out_name}/{{group}}/05_binned/{{sample}}",
+            temp_dir = f"{temp_scratch_dir}/{{group}}/assembly",
+            unzip_assembly = f"{temp_scratch_dir}/{{group}}/assembly/{{sample}}_{{a_type}}_{{t_type}}_contigs.fa",
+            prefix = f"{{sample}}_ros_{{a_type}}_{{t_type}}",
+            min_contig = config['min_contig']
+        shell:
+            """
+            mkdir -p {params.temp_dir}
+            if [[ ! -f {params.unzip_assembly} ]]
+            then
+            pigz -dc {input.contigs} > {params.unzip_assembly}
+            fi
+            
+            mkdir -p {params.parent_dir}
+            
+            rosella recover -r {params.unzip_assembly} \
+            -i {input.cov_file} -o {output.out_dir}/ -t {threads} --min-contig-size {params.min_contig} | tee -a {log} \
+            || true
+            
+            rename .fna .fa {output.out_dir}/*.fna &> /dev/null || true 
+            rename rosella_bin. {params.prefix}. {output.out_dir}/* &> /dev/null || true 
+            rm {params.unzip_assembly}.fai || true
+
+            """
+
+
+rule das_tool:
+    input:
+        assembly = ancient(f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/{{sample}}_{{a_type}}"
+                           f"_{{t_type}}_contigs.fa.gz"),
+        rn_touch= ancient(rules.rename_contigs.output.rn_done_touch),
+        bin_dirs = lambda wildcards: ancient(expand(f"{out_name}/{{group}}/05_binned/{{sample}}/{{sample}}_{{binner}}_"
+                                                    f"{{a_type}}_{{t_type}}",sample=wildcards.sample,
+                                                group=wildcards.group,a_type=wildcards.a_type,binner=binners,
+                                                t_type=wildcards.t_type)),
+        bin_touch = lambda wildcards: ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/05_binned/{{sample}}_ros_{{a_type}}_{{t_type}}_bin.touch",
+                                                sample=wildcards.sample,
+                                                group=wildcards.group,a_type=wildcards.a_type,binner=binners,
+                                                t_type=wildcards.t_type)),
+    output:
+        out_dir = directory(f"{out_name}/{{group}}/05_binned/{{sample}}_{{a_type}}_{{t_type}}_dastool"),
+        dt_file = touch(f"{out_name}/temp/touchfiles/{{group}}/05_binned/{{sample}}_{{a_type}}_{{t_type}}_dt.touch")
+    conda: "dastool"
+    resources:
+        mem_per_cpu = get_mem_cpu('low'),
+        mem_mb = get_mem_mb(mem_level='low'),
+        time="24:00:00"
+    params:
+        unzip_assembly = f"{temp_scratch_dir}/{{group}}/assembly/{{sample}}_{{a_type}}_{{t_type}}_contigs.fa",
+        out_prefix = f"{out_name}/{{group}}/05_binned/{{sample}}_{{a_type}}_{{t_type}}_dastool/{{sample}}_{{a_type}}_{{t_type}}_dt"
+    shell:
+        """
+        set +u
+        unset BINNERS
+        unset BIN_FILES
+        
+        
+        none_passed () {{ 
+        echo "No files passed DAS Tool. Exiting."
+        touch {output.out_dir}/no_passed_genomes.touch
+        }}
+        
+        
+        mkdir -p {output.out_dir}
+        if [[ ! -f {params.unzip_assembly} ]]
+        then
+        pigz -dc {input.assembly} > {params.unzip_assembly}
+        fi
+        
+        for x in {input.bin_dirs}
+        do 
+        
+        CURRENT_BINNER="$(echo basename $x | awk -F_ '{{print $(NF-2)}}' )"
+        bash Fasta_to_Contig2Bin.sh -i $x -e fa > ${{x}}/${{CURRENT_BINNER}}_contigs2bin.txt
+        
+        BIN_FILES="${{BIN_FILES}}${{x}}/${{CURRENT_BINNER}}_contigs2bin.txt,"
+        BINNERS="${{BINNERS}}${{CURRENT_BINNER}}," 
+        done
+        
+        BINNERS=$(echo $BINNERS | sed 's/,$//')
+        BIN_FILES=$(echo $BIN_FILES | sed 's/,$//')
+        
+        DAS_Tool -i $BIN_FILES -l $BINNERS -c {params.unzip_assembly} --write_bins \
+        -o {params.out_prefix} || none_passed
+        
+        no_bins_found=$(find {output.out_dir} -type f -name '\*.fa' | wc -c | awk '{{print $1}}')
+        
+        if [[ "$no_bins_found" -gt 1 ]]
+        then 
+        echo "No bins found for this sample."
+        find {output.out_dir} -type f -name '\*.fa' -exec rm {{}} \;
+        fi
+        
+        rm {params.unzip_assembly} {output.out_dir}/*dt_proteins.faa* {output.out_dir}/*dt.seqlength &> /dev/null || true 
+        """
+
+rule checkm2:
+    input:
+        in_files = lambda wildcards: ancient(expand(f"{out_name}/{wildcards.group}/05_binned/"
+                                                    f"{wildcards.sample}_{{a_type}}_{{t_type}}_dastool",
+                                                a_type=a_type,t_type=t_type)),
+        DT_touch = lambda wildcards: ancient(expand(f"{out_name}/temp/touchfiles/{wildcards.group}/05_binned/"
+                                                    f"{wildcards.sample}_{{a_type}}_{{t_type}}_dt.touch",
+                                                a_type=a_type,t_type=t_type))
+    output:
+        touch(f"{out_name}/temp/touchfiles/{{group}}/06_mags/sample-{{sample}}_checkm.touch"),
+        checkm_res = f"{out_name}/{{group}}/06_mags/checkm2/{{sample}}_cm_report.tsv"
+    conda: 'checkm2'
+    threads: 24
+    resources:
+        mem_per_cpu = get_mem_cpu('med'),
+        mem_mb = get_mem_mb(mem_level='med'),
+        time="24:00:00"
+    params:
+        out_dir = f"{out_name}/{{group}}/06_mags/checkm2/{{sample}}_checkm",
+        no_bins = f"{out_name}/{{group}}/06_mags/checkm2/{{sample}}_checkm_no_bins_predicted"
+    shell:"""
+    find  {input.in_files} -type f -name '\*.fa' -exec rm {{}} \;
+    rm -r {params.out_dir} &> /dev/null || true 
+    
+
+    if [[ $(find {input.in_files} -type f -name '*.fa' | wc -c) -eq 0 ]] 
+    then
+    echo "No bins predicted for sample {wildcards.sample}"
+    touch {output.checkm_res} {params.no_bins}
+    exit 0
+    fi
+    
+    checkm2 predict -i $(find {input.in_files} -type f -name '*.fa' | tr '\n' ' ') -o {params.out_dir} -t {threads}
+    mv {params.out_dir}/quality_report.tsv {output.checkm_res} 
+    rm -r {params.out_dir}
+    """
+
+
+rule drep_prep:
+    input:
+        in_files = lambda wildcards: ancient(expand(f"{out_name}/{wildcards.group}/05_binned/"
+                                                    f"{wildcards.sample}_{{a_type}}_{{t_type}}_dastool",
+            a_type=a_type,t_type=t_type)),
+        DT_touch = lambda wildcards: ancient(expand(f"{out_name}/temp/touchfiles/{wildcards.group}/05_binned/"
+                                                    f"{wildcards.sample}_{{a_type}}_{{t_type}}_dt.touch",
+            a_type=a_type,t_type=t_type)),
+        checkm_report = ancient(rules.checkm2.output.checkm_res)
+    output:
+        sample_bins = f"{out_name}/{{group}}/05_binned/info/{{sample}}_bins.txt",
+        drep_cm_file = f"{out_name}/{{group}}/05_binned/info/{{sample}}_cm_genomeinfo.csv",
+        prep_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/05_binned/prep_{{sample}}_drep.touch")
+    threads: get_threads('low')
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low',thread_level='low')
+    params:
+        no_bins_passed = rules.checkm2.params.no_bins
+    run:
+        rename_dict = {'Name': 'genome', 'Completeness': 'completeness', 'Contamination': 'contamination'}
+        if not os.path.exists(params.no_bins_passed):
+            df = pd.read_table(input.checkm_report).rename(columns=rename_dict).loc[:,
+                 ('genome', 'completeness', 'contamination')]
+            df['genome'] = df['genome'] + '.fa'
+            df.to_csv(output.drep_cm_file,index=False)
+            shell("find {input.in_files} -type f -name '*.fa' > {output.sample_bins}")
+        else:
+            shell("touch {output.sample_bins} {output.drep_cm_file}")
+
+
+rule drep_sample_level:
+    input:
+        bins_list = ancient(rules.drep_prep.output.sample_bins),
+        quality_list = ancient(rules.drep_prep.output.drep_cm_file),
+        prep_touch_d = ancient(rules.drep_prep.output.prep_touch)
+    output:
+        outdir = directory(f"{out_name}/{{group}}/06_mags/{{sample}}_drep"),
+        touch_done = touch(f"{out_name}/temp/touchfiles/{{group}}/06_mags/sample-{{sample}}_drep.touch")
+    log: f"{out_name}/{{group}}/reports/{{sample}}_drep/drep.log"
+    resources:
+        mem_per_cpu=get_mem_cpu('high'),
+        mem_mb=get_mem_mb(mem_level='high'),
+        time="36:00:00"
+    threads: get_threads()
+    conda: "drep_env"
+    params:
+        S_ani=config['drep']['S_ani'],
+        S_algorithm=config['drep']['S_algorithm'],
+        comp=config['drep']['comp'],
+        con=config['drep']['con'],
+         # in_files = drep_sample_files If doing samples instead of DAS-tool
+    shell:
+        """
+        
+        drep_alt () {{ 
+        mkdir -p {output.outdir}/dereplicated_genomes
+        
+        if [[ ! -e {output.outdir}/log/logger.log ]]
+        then
+        echo "No files passed drep and checkm2. Exiting."
+        touch {output.outdir}/no_passed_genomes.touch
+        
+        elif [[ "$(cat {output.outdir}/log/logger.log | grep 'INFO     0.00% of genomes passed checkM filtering' | wc -l)" \
+        -eq 1 ]] || [[ "$( wc -l <{input.bins_list} )" -lt 1 ]]
+        then
+        echo "No files passed drep and checkm2. Exiting."
+        touch {output.outdir}/no_passed_genomes.touch
+        
+        else
+        echo "Some files passed filtering, but drep did not pass these."
+        echo "Please manually move files passing filtering to  {output.outdir}/dereplicated_genomes."
+        echo " Then, run snakemake -c1 --touch {output.touch_done} . Exiting."
+        echo "Bin locations are in file: {input.bins_list}"
+        cat {input.quality_list}
+        exit 1
+        fi
+        }}
+        
+        
+        dRep dereplicate {output.outdir} -p {threads} -g {input.bins_list} --genomeInfo {input.quality_list} \
+        --S_ani {params.S_ani} --S_algorithm {params.S_algorithm} -comp {params.comp} -con {params.con} | tee -a {log} || \
+        drep_alt
+        
+        """
+
+rule drep_group_level:
+    input:
+        in_log = ancient(lambda wildcards: expand(f"{out_name}/{{group}}/reports/{{sample}}_drep/drep.log",
+                                                    sample=samples_in_group[wildcards.group],group=wildcards.group)),
+        drep_smp_touch = ancient(lambda wildcards: expand(f"{out_name}/temp/touchfiles/{{group}}/06_mags/"
+                                                          f"sample-{{sample}}_drep.touch",group=wildcards.group,
+                                                            sample=samples_in_group[wildcards.group])),
+        in_quality = ancient(lambda wildcards: expand(f"{out_name}/{{group}}/05_binned/info/{{sample}}_cm_genomeinfo.csv",
+            sample=samples_in_group[wildcards.group],group=wildcards.group))
+    output:
+        outdir = directory(f"{out_name}/{{group}}/06_mags/group-drep"),
+        dr_group_done = touch(f"{out_name}/temp/touchfiles/{{group}}/06_mags/group-{{group}}_drep.touch"),
+        group_quality = f"{out_name}/{{group}}/05_binned/info/group_{{group}}_cm_genomeinfo.csv",
+        group_drep_bins = f"{out_name}/{{group}}/05_binned/info/group_{{group}}_bins.txt"
+    log: f"{out_name}/{{group}}/reports/group-drep.log"
+    resources:
+        mem_per_cpu=get_mem_cpu('high'),
+        mem_mb=get_mem_mb(mem_level='high'),
+        time="36:00:00"
+    threads: get_threads()
+    conda: "drep_env"
+    params:
+        S_ani=config['drep']['S_ani'],
+        S_algorithm=config['drep']['S_algorithm'],
+        comp=config['drep']['comp'],
+        con=config['drep']['con'],
+        in_files = lambda wildcards: expand(f"{out_name}/{{group}}/06_mags/{{sample}}_drep/dereplicated_genomes",
+            sample=samples_in_group[wildcards.group], group=wildcards.group),
+        mags_list = f"{out_name}/{{group}}/06_mags/group-drep/{{group}}_drep_mag_list.txt"
+    shell:
+        """
+        rm {output.group_drep_bins} &> /dev/null || true 
+        
+        find {params.in_files} -type f -name '*.fa' >> {output.group_drep_bins}
+        
+        
+
+        if (( "$(wc -l < {output.group_drep_bins})"  == 0  ))
+        then
+        echo 'No addidional dereplication reported for this group, as there is only one bin.' | tee -a {log}
+        mkdir -p {output.outdir}/dereplicated_genomes
+        xargs -a {output.group_drep_bins} cp -t {output.outdir}/dereplicated_genomes/
+        for x in {output.outdir}/dereplicated_genomes/* ; do pigz ${{x}} ; done 
+        exit 0
+
+        elif (( "$(echo {params.in_files} | wc -w)"  <= 1  ))
+        then
+        echo 'No addidional dereplication reported for this group, as there is only one sample.' | tee -a {log}
+        mkdir -p {output.outdir}/dereplicated_genomes
+        find {params.in_files}  -type f -name '*.fa*' -exec cp {{}} {output.outdir}/dereplicated_genomes/ \;
+        for x in {output.outdir}/dereplicated_genomes/* ; do pigz ${{x}} ; done 
+        exit 0
+        fi
+        
+        echo 'genome,completeness,contamination' >> {output.group_quality}
+        for x in {input.in_quality} ; do tail -n+2 $x >> {output.group_quality} ; done
+
+        dRep dereplicate {output.outdir} -p {threads} -g {output.group_drep_bins} --genomeInfo {output.group_quality}  \
+        --S_ani {params.S_ani} --S_algorithm {params.S_algorithm} -comp {params.comp} -con {params.con} | tee -a {log}
+        
+        find {output.outdir} -type f -name '*.fa' -exec pigz {{}} \;
+        find {output.outdir} -type f -name '*.fa.gz' > {params.mags_list}
+                
+        """
+
+
+rule classify_gtdb:
+    input:
+        in_dir = ancient(f"{out_name}/{{group}}/06_mags/{{sample}}_drep"),
+        drep_touch = ancient(f"{out_name}/temp/touchfiles/{{group}}/06_mags/sample-{{sample}}_drep.touch"),
+        dr_group_done = ancient(f"{out_name}/temp/touchfiles/{{group}}/06_mags/group-{{group}}_drep.touch"),
+        unbin_rename_done = ancient(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_unbinned.touch")
+    output:
+        outdir= directory(f"{out_name}/{{group}}/07_mag_analysis/classify/{{sample}}_classify"),
+        touch_done = touch(f"{out_name}/temp/touchfiles/{{group}}/06_mags/{{sample}}_gtdb.touch"),
+    log:  f"{out_name}/{{group}}/07_mag_analysis/logs/{{sample}}_gtdb.log"
+    threads: get_threads()
+    conda: "gtdbtk_2.1"
+    resources:
+        mem_per_cpu=get_mem_cpu('high'),
+        mem_mb=get_mem_mb(mem_level='high'),
+        time = '24:00:00'
+    params:
+        ext=config['classify_gtdb']['ext'],
+        GTDBTK_DBPATH=config['classify_gtdb']['dbpath'],
+
+    shell:"""
+        export GTDBTK_DATA_PATH={params.GTDBTK_DBPATH}
+        rm -r {temp_scratch_dir}/gtdb-{wildcards.sample}-temp &> /dev/null || true 
+        mkdir -p {temp_scratch_dir}/gtdb-{wildcards.sample}-temp
+        
+        if [[ -e {input.in_dir}/no_passed_genomes.touch ]]  
+        then
+        echo "No genomes to classify. Exiting"
+        mkdir -p {output.outdir}
+        touch {output.outdir}/no_passed_genomes.touch
+        exit 0
+        fi
+        
+
+        gtdbtk classify_wf -x {params.ext} --cpus {threads}  --genome_dir {input.in_dir}/dereplicated_genomes \
+         --out_dir {output.outdir} --pplacer_cpus {threads} --tmpdir {temp_scratch_dir}/gtdb-{wildcards.sample}-temp/ \
+         | tee -a {log}
+         
+        rm -r {temp_scratch_dir}/gtdb-{wildcards.sample}-temp || true
+        """
+
+
+rule coverm:
+    input:
+        read1 = lambda wildcards: ancient(expand(f"{out_name}/{wildcards.group}/01_trimmed/{{sample}}-t.fq.gz",
+                                        sample=samples_in_group[wildcards.group])),
+        bins = ancient(f"{out_name}/{{group}}/06_mags/group-drep")
+    output:
+        outdir = directory(f"{out_name}/{{group}}/07_mag_analysis/group-coverage"),
+        coverm_touch_done = touch(f"{out_name}/temp/touchfiles/{{group}}/07_mag_analysis/{{group}}_coverm.touch")
+    log: f"{out_name}/{{group}}/reports/coverm.log"
+    conda: "coverm"
+    threads: get_threads()
+    resources:
+        time = '64:00:00',
+        mem_per_cpu= get_mem_cpu('med'),
+        mem_mb= get_mem_mb(mem_level='med'),
+    params:
+        ext = config['coverm']['ext'],
+        min_id = config['coverm']['min_id'],
+        trim_min = config['coverm']['trim_min'],
+        trim_max = config['coverm']['trim_max'],
+        add_params = config['coverm']['add_params'],
+        tmpdir = f"{temp_scratch_dir}/{{group}}/coverm"
+    shell:
+        """    
+        mkdir -p {output.outdir}
+        
+        rm -r {params.tmpdir} &> /dev/null || true 
+        mkdir -p {params.tmpdir}
+        find {input.bins}/dereplicated_genomes -type f -name '*.fa.gz' -exec cp {{}} -t {params.tmpdir} \;
+        for x in {params.tmpdir}/*.fa.gz ; do pigz -d $x ; done
+        
+        coverm genome -m trimmed_mean -d {params.tmpdir} -x fa \
+        --output-file {output.outdir}/{wildcards.group}_tad80.tsv --trim-max {params.trim_max} --trim-min \
+        {params.trim_min}  {params.add_params} --min-read-percent-identity {params.min_id} -t {threads} \
+        --bam-file-cache-directory {output.outdir}/{wildcards.group}_coverm_bamf  --single {input.read1} > {log}
+        
+        rm -r {params.tmpdir}
+        """
+
+
+rule fastani:
+    input:
+        in_files = ancient(expand(f"{out_name}/{{group}}/06_mags/{{sample}}_drep",zip,sample=SAMPLES,group=GROUPS)),
+        drep_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/06_mags/sample-{{sample}}_drep.touch",
+                                    zip,sample=SAMPLES,group=GROUPS))
+    output:
+        ani_analysis = f"{out_name}/study_analysis/identity_comp/gANI",
+        ani_touch = touch(f"{out_name}/temp/touchfiles/gANI.touch")
+    conda: "analysis_db"
+    threads: get_threads()
+    resources:
+        mem_per_cpu=get_mem_cpu('med_low'),
+        mem_mb= get_mem_mb(mem_level='med_low'),
+        time = '24:00:00'
+
+    shell:"""
+        rm {temp_scratch_dir}/ani_bins.txt &> /dev/null || true 
+        
+        for x in {input.in_files}
+        do 
+        find ${{x}}/dereplicated_genomes -type f -name '*.fa*' >>  {temp_scratch_dir}/ani_bins.txt 
+        done
+        
+        fastANI --ql {temp_scratch_dir}/ani_bins.txt  --rl {temp_scratch_dir}/ani_bins.txt  -o {output.ani_analysis} \
+        --matrix -t {threads}
+    
+    """
+
+rule fastaai:
+    input:
+        in_files=ancient(expand(f"{out_name}/{{group}}/06_mags/{{sample}}_drep",zip,sample=SAMPLES,group=GROUPS)),
+        drep_touch=ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/06_mags/sample-{{sample}}_drep.touch",
+            zip,sample=SAMPLES,group=GROUPS))
+    output:
+        aai_analysis=directory(f"{out_name}/study_analysis/identity_comp/gAAI"),
+        aai_touch=touch(f"{out_name}/temp/touchfiles/gAAI.touch")
+    conda: "analysis_db"
+    threads: get_threads()
+    resources:
+        mem_per_cpu=get_mem_cpu('high'),
+        mem_mb=get_mem_mb(mem_level='high'),
+        time='24:00:00'
+    params:
+        add_params = config['fastaai']['add_params'],
+        sample_dir = f"{out_name}/study_analysis/identity_comp/sample_dbs",
+        parent_dir = f"{out_name}/study_analysis/identity_comp"
+    shell: """
+        rm {params.parent_dir}/aai_dbs.txt &> /dev/null || true 
+        mkdir -p {output.aai_analysis} {params.sample_dir}
+        
+        for x in {input.in_files}
+        do 
+        fastaai build_db  --genomes ${{x}}/dereplicated_genomes/ {params.add_params} --threads {threads} \
+        --output {params.sample_dir}/$(basename $x ) --database $(basename $x ).db --compress 
+        echo {params.sample_dir}/$(basename $x )/database/$(basename $x ).db >> {params.parent_dir}/aai_dbs.txt
+        done
+        
+        fastaai merge_db --donor_file {params.parent_dir}/aai_dbs.txt -r {output.aai_analysis}/all_sample_aai.db \
+        --threads {threads}
+        
+        fastaai db_query --query {output.aai_analysis}/all_sample_aai.db --target {output.aai_analysis}/all_sample_aai.db \
+        --threads {threads} {params.add_params} --output {output.aai_analysis} --do_stdev 
+        
+        rm -r {params.sample_dir}
+    """
+
+
+#### ANNOTATION AREA ####
+
+rule process_mags:
+    input:
+        assembly = lambda wildcards: ancient(expand(f"{out_name}/{{group}}/03_assembly/{{sample}}/"
+                           f"{{a_type}}_{{t_type}}/{{sample}}_{{a_type}}_{{t_type}}_contigs.fa.gz",
+                            sample=wildcards.sample,group=wildcards.group,a_type=a_type,t_type=t_type)),
+        mag_files = ancient(f"{out_name}/{{group}}/06_mags/{{sample}}_drep"),
+        dr_group_done = ancient(f"{out_name}/temp/touchfiles/{{group}}/06_mags/group-{{group}}_drep.touch")
+    output:
+        unbinned_contig_file = f"{out_name}/{{group}}/05_binned/{{sample}}_unbinned.fa.gz",
+        proc_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_unbinned.touch")
+    run:
+        import glob, os
+        binned_contig_set = set()
+        for bin_file in glob.glob(f"{input.mag_files}/dereplicated_genomes/*.fa*", recursive=True):
+            with open_file(bin_file) as in_file:
+                for title, read in SeqIO.FastaIO.SimpleFastaParser(in_file):
+                    binned_contig_set.add(title)
+            shell("pigz {bin_file} &> /dev/null")
+        for contig_file in input.assembly:
+            with gzip.open(contig_file,'rt') as in_file, gzip.open(output.unbinned_contig_file,'at') as out:
+                for title, read in SeqIO.FastaIO.SimpleFastaParser(in_file):
+                    if title not in binned_contig_set:
+                        out.write(f">{title}\n{read}\n")
+
+## BINNED CONTIGS ##
+
+rule bakta_mag:
+    input:
+        mag_files = ancient(f"{out_name}/{{group}}/06_mags/{{sample}}_drep"),
+        drep_sample_done =  ancient(f"{out_name}/temp/touchfiles/{{group}}/06_mags/"
+                                                            f"sample-{{sample}}_drep.touch"),
+        unbin_zip_done = ancient(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_unbinned.touch")
+    output:
+        bakta_done_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_bakta_annot.touch"),
+        bins_file = f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/sample_{{sample}}_bins.txt"
+    resources:
+        mem_per_cpu=get_mem_cpu('med_low'),
+        mem_mb=get_mem_mb(mem_level='med_low'),
+        time = '52:00:00'
+    threads: get_threads()
+    conda: "bakta_env"
+    params:
+        out_dir = f"{out_name}/{{group}}/08_annotate/{{sample}}_annot",
+        bakta_db = config['bakta']['db'],
+        temp_file = f"{temp_scratch_dir}/{{group}}/bakta-{{group}}-bins.txt",
+        add_params = config['bakta']['add_params']
+    shell:"""
+    
+    export BAKTA_DB={params.bakta_db}
+    mkdir -p {params.out_dir}
+    find {input.mag_files} -type f -name '*.fa.gz' > {params.out_dir}/{wildcards.sample}_bins.txt
+    
+    while read x
+    do
+    PREFIX=$(basename $x | sed 's/\.fa\.gz$//')
+    OUT_DIR="{params.out_dir}/${{PREFIX}}/bakta"
+    rm -r $OUT_DIR &> /dev/null || true 
+    mkdir -p $OUT_DIR 
+    
+    bakta --output $OUT_DIR -p ${{PREFIX}}  \
+    {params.add_params} --tmp-dir {temp_scratch_dir} --keep-contig-headers $x
+    
+    done<{params.out_dir}/{wildcards.sample}_bins.txt
+    
+    find {params.out_dir} -type f -name '*.faa' | awk '! /hypotheticals.faa/  && ! /unbin/' > {output.bins_file}
+    """
+
+rule eggnog_binned:
+    input:
+        bakta_done=ancient(rules.bakta_mag.output.bakta_done_touch),
+        bins_file = ancient(rules.bakta_mag.output.bins_file)
+    output:
+        binned_eg_touch=touch(f"{out_name}/temp/touchfiles/{{group}}/binned_{{sample}}_eggnog.touch")
+    resources:
+        mem_per_cpu=get_mem_cpu('med'),
+        mem_mb=get_mem_mb(mem_level='med'),
+        time='24:00:00'
+    threads: get_threads()
+    conda: "eggnog"
+    params:
+        in_dir = rules.bakta_mag.params.out_dir,
+        out_dir=f"{out_name}/{{group}}/08_annotate/{{sample}}_annot",
+        search_method = config['eggnog']['method']
+    shell: """
+    while read bins 
+    do 
+    PREFIX=$(basename $bins | sed 's/\.faa$//')
+    OUTPUT="{params.out_dir}/${{PREFIX}}/eggnog"
+
+    rm -r $OUTPUT &> /dev/null || true 
+    mkdir -p $OUTPUT
+    
+    emapper.py  -i $bins --itype proteins --output_dir ${{OUTPUT}}/ --cpu {threads} -o $PREFIX \
+    -m {params.search_method} --temp_dir {temp_scratch_dir} --dbmem
+
+    done<{input.bins_file}
+    """
+
+rule dbcan_binned:
+    input:
+        bakta_done=ancient(rules.bakta_mag.output.bakta_done_touch),
+        bins_file = ancient(rules.bakta_mag.output.bins_file)
+    output:
+        binned_dbc_touch=touch(f"{out_name}/temp/touchfiles/{{group}}/binned_{{sample}}_dbcan.touch")
+    resources:
+        mem_per_cpu=get_mem_cpu('med'),
+        mem_mb=get_mem_mb(mem_level='med'),
+        time='24:00:00'
+    threads: get_threads()
+    conda: "run_dbcan"
+    params:
+        in_dir = rules.bakta_mag.params.out_dir,
+        out_dir=f"{out_name}/{{group}}/08_annotate/{{sample}}_annot",
+        db=config['dbcan']['db']
+
+    shell: """
+    while read bins 
+    do 
+    PREFIX=$(basename $bins | sed 's/\.faa$//')
+    OUTPUT="{params.out_dir}/${{PREFIX}}/dbcan"
+
+    rm -r $OUTPUT &> /dev/null || true 
+
+    run_dbcan  $bins protein --out_dir ${{OUTPUT}}/ --db_dir {params.db} \
+    --dia_cpu {threads} --tf_cpu {threads}  --stp_cpu {threads} --eCAMI_jobs {threads}
+
+    done<{input.bins_file}
+    """
+
+## UNBINNED CONTIGS ##
+
+rule genes_unbinned:
+    input:
+        in_file = ancient(rules.process_mags.output.unbinned_contig_file),
+        unbin_touch = ancient(rules.process_mags.output.proc_touch)
+    output:
+        unbin_prot = f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin/{{sample}}_unbin.faa",
+        pred_done_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_predict.touch")
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low'),
+        time='10:00:00'
+    threads: get_threads()
+    conda: "analysis_db"
+    params:
+        out_dir = f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin",
+        prefix = f"{{sample}}_unbin",
+        temp_file=f"{temp_scratch_dir}/{{group}}/{{sample}}-unbin.fa",
+        unbin_gff= f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin/{{sample}}_unbin.gff",
+        add_params=config['bakta']['add_params']
+    shell: """
+    rm {params.out_dir}/{params.prefix}* &> /dev/null || true 
+    mkdir -p {params.out_dir}
+    pigz -dc {input.in_file} > {params.temp_file}
+    pyrodigal -a {output.unbin_prot} -d {params.out_dir}/{params.prefix}.fna \
+    -i {params.temp_file} -o {params.unbin_gff} -p meta
+    rm {params.temp_file}
+    """
+
+
+rule cluster_unbinned:
+    input:
+        done_pred = ancient(rules.genes_unbinned.output.pred_done_touch),
+        prots = ancient(rules.genes_unbinned.output.unbin_prot)
+    output:
+        clu_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_prot_drep.touch"),
+        drep_prots = f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin/{{sample}}_drep_unbin.faa",
+        drep_tsv = f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin/{{sample}}_prot_drep.tsv"
+    threads: 24
+    conda: 'mmseqs2'
+    resources:
+        mem_per_cpu = get_mem_cpu('med'),
+        mem_mb = get_mem_mb(mem_level='med'),
+        time = '10:00:00'
+    params:
+        seq_dir = rules.genes_unbinned.params.out_dir,
+        prefix = rules.genes_unbinned.params.prefix,
+        temp_dir = f"{temp_scratch_dir}/{{group}}/08_annotate/{{sample}}_unbin/prot_clu",
+        min_id = config['mmseqs']['min_seq_id'],
+        cov = config['mmseqs']['c'],
+        sens = config['mmseqs']['s'],
+        add_params = config['mmseqs']['add_params'],
+    shell:"""
+    rm -r {params.temp_dir} &> /dev/null || true 
+    mkdir -p {params.temp_dir}
+    
+    mmseqs createdb {params.seq_dir}/{params.prefix}.faa {params.temp_dir}/unbinned.db
+    mmseqs cluster {params.temp_dir}/unbinned.db {params.temp_dir}/unbinned_res.db {params.temp_dir}/tmp \
+    --min-seq-id {params.min_id} -c {params.cov} -s {params.sens} --remove-tmp-files
+    
+    mmseqs createtsv {params.temp_dir}/unbinned.db {params.temp_dir}/unbinned.db {params.temp_dir}/unbinned_res.db \
+     {output.drep_tsv}
+     
+    mmseqs createsubdb  {params.temp_dir}/unbinned_res.db {params.temp_dir}/unbinned.db {params.temp_dir}/unbinned_sub.db
+    
+    mmseqs convert2fasta {params.temp_dir}/unbinned_sub.db {output.drep_prots}
+    
+    rm -r {params.temp_dir}
+    """
+
+rule bakta_unbinned:
+    input:
+        clu_touch = ancient(rules.cluster_unbinned.output.clu_touch),
+        prots= ancient(rules.cluster_unbinned.output.drep_prots),
+    output:
+        bakta_done_touch=touch(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_bakta.touch"),
+        out_dir = directory(f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin/bakta"),
+    resources:
+        mem_per_cpu=get_mem_cpu('med'),
+        mem_mb=get_mem_mb(mem_level='med'),
+        time='24:00:00'
+    threads: get_threads()
+    conda: "bakta_env"
+    params:
+        prefix = f"{{sample}}_unbin",
+        bakta_db=config['bakta']['db'],
+        add_params=config['bakta']['add_params']
+    shell: """
+
+    export BAKTA_DB={params.bakta_db}
+    rm -r {output.out_dir} &> /dev/null || true 
+   
+    bakta_proteins --output {output.out_dir} -p {params.prefix}  \
+     --tmp-dir {temp_scratch_dir} {input.prots}
+
+    """
+
+rule eggnog_unbinned:
+    input:
+        clu_touch = ancient(rules.cluster_unbinned.output.clu_touch),
+        prots= ancient(rules.cluster_unbinned.output.drep_prots)
+    output:
+        eg_done_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_eggnog.touch"),
+        out_dir= directory(f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin/eggnog"),
+    resources:
+        mem_per_cpu=get_mem_cpu('med'),
+        mem_mb=get_mem_mb(mem_level='med'),
+        time='24:00:00'
+    threads: get_threads()
+    conda: "eggnog"
+    params:
+        in_dir = rules.genes_unbinned.params.out_dir,
+        prefix = f"{{sample}}_unbin",
+        search_method=config['eggnog']['method'],
+
+    shell: """
+    rm -r {output.out_dir} &> /dev/null || true 
+    
+    mkdir -p {output.out_dir}
+    
+    emapper.py  -i {input.prots} --itype proteins --output_dir {output.out_dir}/ --cpu {threads} \
+    -o {params.prefix} -m {params.search_method} --temp_dir {temp_scratch_dir} --dbmem
+    """
+
+rule dbcan_unbinned:
+    input:
+        clu_touch = ancient(rules.cluster_unbinned.output.clu_touch),
+        prots= ancient(rules.cluster_unbinned.output.drep_prots),
+    output:
+        unbin_dbc_touch=touch(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_dbcan.touch"),
+        out_dir = directory(f"{out_name}/{{group}}/08_annotate/{{sample}}_annot/{{sample}}_unbin/dbcan"),
+    resources:
+        mem_per_cpu=get_mem_cpu('med'),
+        mem_mb=get_mem_mb(mem_level='med'),
+        time='24:00:00'
+    threads: get_threads()
+    conda: "run_dbcan"
+    params:
+        db = config['dbcan']['db']
+
+    shell:"""
+    rm -r {output.out_dir} &> /dev/null || true 
+    
+    run_dbcan {input.prots} protein --out_dir {output.out_dir}/ --db_dir {params.db} \
+     --dia_cpu {threads} --tf_cpu {threads}  --stp_cpu {threads} --eCAMI_jobs {threads}
+    """
+
+### GETTING GENE COUNTS ###
+
+
+rule group_featurecounts:
+    input:
+        bam_files = ancient(f"{out_name}/{{group}}/07_mag_analysis/group-coverage"),
+        gff_files = lambda wildcards: ancient(expand(f"{out_name}/temp/touchfiles/{wildcards.group}/"
+                                                    f"{{sample}}_bakta_annot.touch",
+                                                    sample=samples_in_group[wildcards.group])),
+    output:
+        fc_dir = directory(f"{out_name}/{{group}}/09_gene_analysis/coverage/group"),
+        fc_done = touch(f"{out_name}/temp/touchfiles/{{group}}/fc_{{group}}.touch"),
+    log: f"{out_name}/{{group}}/09_gene_analysis/logs/group-fc.log"
+    threads: get_threads()
+    params:
+        group_drep_list = rules.drep_group_level.params.mags_list,
+        fc_bin = config['feature_counts']['bin'],
+        temp_dir = f"{temp_scratch_dir}/{{group}}",
+        coverm_bam_dir = f"{out_name}/{{group}}/07_mag_analysis/group-coverage/{{group}}_coverm_bamf",
+        group_fa_files = f"{out_name}/{{group}}/06_mags/group-drep/dereplicated_genomes",
+        group_annot_folder = f"{out_name}/{{group}}/08_annotate"
+    shell:"""
+    mkdir -p {output.fc_dir} {params.temp_dir}
+    
+    while read line
+    do 
+    BIN_NAME="$(basename $line |  sed 's/\.fa\.gz$//')"
+    GFF_NAME=$(find {params.group_annot_folder} -type f -name "${{BIN_NAME}}.gff3")
+    awk -v prefix=$BIN_NAME '$0 ~ /ID=/ {{print prefix"~"$0}}' $GFF_NAME >> {output.fc_dir}/group-{wildcards.group}_annot.gff
+    done<{params.group_drep_list}
+    
+    {params.fc_bin} -a {output.fc_dir}/group-{wildcards.group}_annot.gff \
+    -t CDS,CRISPR,ncRNA,oriC,oriT,rRNA,regulatory_region,tRNA,tmRNA \
+    -g ID  -o {output.fc_dir}/group-{wildcards.group}_fc.txt -T {threads} {params.coverm_bam_dir}/*.bam >> {log}
+    
+    
+    
+    
+ 
+    """
+
+rule sample_featurecounts:
+    input:
+        bam_files = lambda wildcards: ancient(expand(f"{out_name}/{wildcards.group}/04_mapped/{wildcards.sample}/"
+                                            f"{wildcards.sample}_{{a_type}}_{{t_type}}.bam",a_type=a_type,t_type=t_type)),
+        gff_touch = ancient(rules.bakta_mag.output.bakta_done_touch),
+        sample_bins = ancient(rules.drep_sample_level.output.outdir),
+    output:
+        fc_dir = directory(f"{out_name}/{{group}}/09_gene_analysis/coverage/{{sample}}"),
+        fc_done = touch(f"{out_name}/temp/touchfiles/{{group}}/fc_sample/binned/fc-{{sample}}.touch"),
+    log: f"{out_name}/{{group}}/09_gene_analysis/logs/{{sample}}-fc.log"
+    threads: get_threads()
+    params:
+        gff_dir = rules.bakta_mag.params.out_dir,
+        temp_dir= f"{temp_scratch_dir}/{{group}}",
+        fc_bin= config['feature_counts']['bin']
+    shell:"""
+    rm {params.temp_dir}/{wildcards.sample}-fc-bins.txt &> /dev/null || true 
+    mkdir -p {output.fc_dir} {params.temp_dir}
+    
+    find {input.sample_bins}/dereplicated_genomes -type f -name '*.fa.gz' > {params.temp_dir}/{wildcards.sample}-fc-bins.txt
+    
+    while read line
+    do 
+    BIN_NAME="$(basename $line |  sed 's/\.fa\.gz$//')"
+    GFF_NAME=$(find {params.gff_dir} -type f -name "${{BIN_NAME}}.gff3")
+    
+    {params.fc_bin} -a $GFF_NAME -t CDS,CRISPR,ncRNA,oriC,oriT,rRNA,regulatory_region,tRNA,tmRNA -g ID   \
+    -o {output.fc_dir}/${{BIN_NAME}}_fc.txt -T {threads} {input.bam_files} &>> {log}
+    done<{params.temp_dir}/{wildcards.sample}-fc-bins.txt    
+    
+    """
+
+rule unbin_featurecounts:
+    input:
+        bam_files=lambda wildcards: ancient(expand(f"{out_name}/{wildcards.group}/04_mapped/{wildcards.sample}/"
+                                                   f"{wildcards.sample}_{{a_type}}_{{t_type}}.bam",a_type=a_type,t_type=t_type)),
+        unbin_touch = ancient(rules.genes_unbinned.output.pred_done_touch)
+    output:
+        fc_done=touch(f"{out_name}/temp/touchfiles/{{group}}/fc_sample/unbin/fc-{{sample}}.touch"),
+    threads: get_threads()
+    params:
+        temp_dir=f"{temp_scratch_dir}/{{group}}",
+        unbin_gff=ancient(rules.genes_unbinned.params.unbin_gff),
+        fc_unbin=f"{out_name}/{{group}}/09_gene_analysis/coverage/{{sample}}/{{sample}}_unbin_fc.txt",
+        fc_bin=config['feature_counts']['bin'],
+        fc_dir = f"{out_name}/{{group}}/09_gene_analysis/coverage/{{sample}}"
+
+    shell: """
+    mkdir -p {params.fc_dir}
+    #gawk -F\t -OFS=\t '{{sub(/_[0-9]+\t/,"\t",$1)}} 1' {params.unbin_gff} > {params.unbin_gff}.rn
+    {params.fc_bin} -a {params.unbin_gff} -t CDS,CRISPR,ncRNA,oriC,oriT,rRNA,regulatory_region,tRNA,tmRNA -g ID \
+      -o {params.fc_unbin} -T {threads} {input.bam_files}
+
+
+    """
+
+rule compress_sample_bam:
+    input:
+        sample_fc_done = ancient(f"{out_name}/temp/touchfiles/{{group}}/fc_sample/binned/fc-{{sample}}.touch"),
+        unbin_fc_done = ancient(f"{out_name}/temp/touchfiles/{{group}}/fc_sample/unbin/fc-{{sample}}.touch"),
+        assembly_ref = ancient(rules.bwa_map.input.assembly),
+        bam_file = ancient(rules.bwa_map.output.bamfile)
+    output:
+        cram_file = f"{out_name}/{{group}}/04_mapped/{{sample}}/{{sample}}_{{a_type}}_{{t_type}}.cram",
+        cram_done = touch(f"{out_name}/temp/touchfiles/{{group}}/04_mapped/{{sample}}_{{a_type}}_{{t_type}}_cram.touch")
+    conda: "coverm"
+    threads: get_threads()
+    resources:
+        mem_per_cpu = get_mem_cpu('med'),
+        mem_mb = get_mem_mb('med'),
+        time = '12:00:00'
+    params:
+        unzip_assm = f"{out_name}/{{group}}/03_assembly/{{sample}}/{{a_type}}_{{t_type}}/"
+                     f"{{sample}}_{{a_type}}_{{t_type}}_contigs.fa"
+    shell:"""
+    pigz -d {input.assembly_ref}
+    samtools view -T {params.unzip_assm} -@ 24 -C -o {output.cram_file} {input.bam_file}
+    pigz {params.unzip_assm}
+    rm {input.bam_file}
+    """
+
+
+
+### GET GENES FOR MMSEQS ###
+
+rule get_all_genes:
+    input:
+        genes_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/{{sample}}_bakta_annot.touch",
+                                    zip, sample=SAMPLES, group=GROUPS)),
+    output:
+        binned_prots = f"{out_name}/study_analysis/binned_genes.faa.gz",
+        all_genes_comp = touch(f"{out_name}/temp/touchfiles/get_all_genes.touch")
+    params:
+        binned_genes = ancient(expand(f"{out_name}/{{group}}/08_annotate/{{sample}}_annot",
+                                    zip, sample=SAMPLES, group=GROUPS)),
+    run:
+        for folder in params.binned_genes:
+            genes_in_folder = [file for file in glob.glob(f"{folder}/**/*.faa", recursive=True) if not \
+                 ('hypotheticals.faa' in file or 'genes.faa' in file or 'unbin' in file)]
+            for bin_file in genes_in_folder:
+                sample_name = os.path.basename(bin_file).rstrip('.faa')
+                shell(f"cat {bin_file} | sed 's/>/>{sample_name}~/g' | pigz >> {output.binned_prots} ")
+
+
+rule collect_unbinned_genes:
+    input:
+        genes_pred = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/unbin_{{sample}}_prot_drep.touch",
+                                    zip, sample=SAMPLES, group=GROUPS))
+    output:
+        binned_prots = f"{out_name}/study_analysis/unbinned_genes.faa.gz",
+        unbin_genes_comp = touch(f"{out_name}/temp/touchfiles/get_unbin_genes.touch")
+    params:
+        unbinned_genes = expand(f"{out_name}/{{group}}/08_annotate",
+                            group=GROUP_IDS),
+    run:
+        for folder in params.unbinned_genes:
+            genes_in_folder = [file for file in glob.glob(f"{folder}/**/*drep_unbin.faa", recursive=True)]
+            for bin_file in genes_in_folder:
+                shell(f"cat {bin_file} | sed 's/>/>unbinned~/g' | pigz >> {output.binned_prots} ")
+
+
+#### DIVERSITY AREA ######
+
+rule microbe_census:
+    conda: "microbe_census"
+    input:
+        read1 = ancient(f"{out_name}/{{group}}/01_trimmed/{{sample}}-t.fq.gz"),
+    output:
+        out_file = f"{out_name}/{{group}}/02_diversity/microbe_census/{{sample}}.geq.txt"
+    threads: get_threads()
+    resources:
+        time = '12:00:00',
+        mem_per_cpu=get_mem_cpu('med_low'),
+        mem_mb=get_mem_mb(mem_level='med_low'),
+    params:
+        n = config['microbe_census']['n'],
+        q = config['microbe_census']['q']
+    shell:
+        """
+        run_microbe_census.py -t {threads} -n {params.n} -q {params.q} {input.read1} {output.out_file} 
+        """
+
+rule collect_geqs:
+    input:
+        geq_files = ancient(expand(f"{out_name}/{{group}}/02_diversity/microbe_census/{{sample}}.geq.txt",zip,
+                                    sample=SAMPLES,group=GROUPS))
+    output:
+        geq_list = f"{out_name}/study_analysis/diversity/study_geqs.csv",
+        get_geqs_done = touch(f"{out_name}/temp/touchfiles/study_geqs.touch")
+    threads: get_threads('low')
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low',thread_level='low')
+    run:
+        samples_geq_dict = defaultdict(dict)
+        for sample in input.geq_files:
+            sample_name = os.path.basename(sample).rstrip('.geq.txt')
+            group_id = sample_name.split('_')[0]
+            samples_geq_dict[sample_name]['Study_ID'] = group_id
+            with open(sample,'r') as in_file:
+                for line in in_file:
+                    if line.startswith("genome_equivalents"):
+                        samples_geq_dict[sample_name]['genome_equivalents'] = (line.split()[1])
+                    elif line.startswith("reads_sampled"):
+                        samples_geq_dict[sample_name]['reads_sampled'] = (line.split()[1])
+                    elif line.startswith("total_bases:"):
+                        samples_geq_dict[sample_name]['total_bases'] = (line.split()[1])
+                    elif line.startswith("average_genome_size"):
+                        samples_geq_dict[sample_name]['average_genome_size'] = (line.split()[1])
+        df = pd.DataFrame.from_dict(samples_geq_dict,orient='index')
+        df.index.name = 'Sample_ID'
+        df.to_csv(output.geq_list)
+
+rule nonpareil:
+    input:
+        in_file = ancient(f"{out_name}/{{group}}/01_trimmed/{{sample}}-t.fq.gz")
+    conda: "analysis_db"
+    output:
+        np_done =  touch(f"{out_name}/temp/touchfiles/{{group}}/diversity/{{sample}}_np.touch"),
+        npo_files = f"{out_name}/{{group}}/02_diversity/nonpareil/{{sample}}.npo"
+    log: f"{out_name}/{{group}}/02_diversity/nonpareil/{{sample}}.log"
+    resources:
+        mem_per_cpu=get_mem2_cpu,
+        mem_mb=get_mem2_mb,
+        time='24:00:00'
+    threads: get_threads()
+    params:
+        unzip_in = f"{out_name}/{{group}}/01_trimmed/{{sample}}-t.fq",
+        T = config['nonpareil']['T'],
+        outdir = f"{out_name}/{{group}}/02_diversity/nonpareil",
+        bbtools_bin= config['bbtools_bin']
+    shell:
+        """
+        mkdir -p {params.outdir}
+        pigz -dc {input.in_file} > {params.unzip_in}
+        {params.bbtools_bin}/reformat.sh in={params.unzip_in} out={params.unzip_in}.temp.fq minlength=24
+        mv {params.unzip_in}.temp.fq  {params.unzip_in}
+        nonpareil -T {params.T} -s {params.unzip_in} \
+        -b {params.outdir}/{wildcards.sample} -f fastq -t {threads}\
+        -l {log}
+        rm {params.unzip_in}
+        """
+
+
+rule collect_np:
+    input:
+        np_touch = ancient(expand(f"{out_name}/temp/touchfiles/{{group}}/diversity/{{sample}}_np.touch",
+                                    zip,sample=SAMPLES,group=GROUPS)),
+        npo_files = ancient(expand(f"{out_name}/{{group}}/02_diversity/nonpareil/{{sample}}.npo",
+                                    zip,sample=SAMPLES,group=GROUPS)),
+    output:
+         tar_np = f"{out_name}/study_analysis/diversity/np_files.tar.gz",
+         np_collect_done = touch(f"{out_name}/temp/touchfiles/np_collect.touch"),
+         np_study_file = f"{out_name}/study_analysis/diversity/np_study.txt"
+    params:
+        out_dir = f"{out_name}/study_analysis/diversity/np_files"
+    run:
+        with open(output.np_study_file,'w') as out:
+            out.write(f"File,Name\n")
+            for sample in input.npo_files:
+                npo_file = sample.split('nonpareil/')[1]
+                name_sample = npo_file.rstrip('.npo')
+                out.write(f"{npo_file},{name_sample}\n")
+        shell("""
+        mkdir -p {params.out_dir}
+        
+        for x in {input.npo_files}
+        do 
+        cp $x {params.out_dir}/
+        done
+        cp {output.np_study_file} {params.out_dir}/
+        tar -czvf {output.tar_np} {params.out_dir}
+        """)
+
+
+rule simka_prep:
+    input:
+        read1= ancient(lambda wildcards: expand(f"{out_name}/{{group}}/01_trimmed/{{sample}}-t.fq.gz",
+            group=wildcards.group, sample=samples_in_group[wildcards.group])),
+
+    output:
+        prep_file = f"{out_name}/{{group}}/02_diversity/info/prep-{{group}}-simka.txt"
+    threads: get_threads('low')
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low',thread_level='low')
+    run:
+        with open(output[0],'w') as out:
+            for line in input.read1:
+                lineid=line.split('/')[-1].split('-t.fq')[0]
+                out.write(f"{lineid}: {os.path.abspath(line)}\n")
+
+rule simka_group:
+    input:
+        prep_file = ancient(rules.simka_prep.output.prep_file),
+        read1= ancient(lambda wildcards: expand(f"{out_name}/{{group}}/01_trimmed/{{sample}}-t.fq.gz",
+            group=wildcards.group,sample=samples_in_group[wildcards.group])),
+    output:
+        out_dir = directory(f"{out_name}/{{group}}/02_diversity/simka"),
+        simka_group_touch = touch(f"{out_name}/temp/touchfiles/{{group}}/simka-{{group}}.touch")
+    log: f"{out_name}/{{group}}/02_diversity/info/simka_log.txt"
+    conda: "analysis_db"
+    resources:
+        mem_per_cpu=get_mem_cpu('high'),
+        mem_mb=get_mem_mb(mem_level='high'),
+        time = '24:00:00'
+    threads: get_threads()
+    params:
+        makefigs = config['simka']['makefigs'],
+        out_tmp = config['scratch_dir'],
+        temp_dir= f"{temp_scratch_dir}/simka_temp_files/{{group}}",
+        max_reads = config['simka']['max_reads'],
+        extra_params = config['simka']['extra_params'],
+        figure_params = config['simka']['figure_params'],
+    shell:
+        """
+        module load r
+        
+        if (( "$(wc -l < {input.prep_file})"  <= 2  ))
+        then
+        echo 'No beta-diversity reported for this group, as there is less than three samples.' > {log}
+        exit 0
+        
+        else    
+        mkdir -p {output.out_dir} {params.temp_dir}
+        
+        simka -in {input.prep_file} -out {output.out_dir}/output {params.extra_params} -max-reads {params.max_reads} \
+        -max-memory {resources.mem_mb} -nb-cores {threads} -out-tmp {params.temp_dir} | tee -a {log}
+
+        python {params.makefigs} -in {output.out_dir}/output -out {output.out_dir}/figures {params.figure_params}
+        fi
+        """
+
+
+rule simka_all:
+    input:
+        prep_files = ancient(expand(f"{out_name}/{{group}}/02_diversity/info/prep-{{group}}-simka.txt",
+                                    group=GROUP_IDS)),
+    output:
+        outdir = directory(f"{out_name}/study_analysis/diversity/simka"),
+        touch_done = touch(f"{out_name}/temp/touchfiles/study_analysis/simka_all.touch")
+    log: f"{out_name}/study_analysis/diversity/simka.log"
+    conda: "analysis_db"
+    resources:
+        mem_per_cpu=get_mem_cpu('high'),
+        mem_mb=get_mem_mb(mem_level='high'),
+        time='24:00:00'
+    threads: get_threads()
+    params:
+        makefigs=config['simka']['makefigs'],
+        max_reads=config['simka']['max_reads'],
+        extra_params=config['simka']['extra_params'],
+        figure_params=config['simka']['figure_params'],
+        temp_dir= f"{temp_scratch_dir}/simka_temp_files/all",
+        prep_all = f"{out_name}/study_analysis/diversity/prep-all-simka.txt"
+    shell:
+        """
+        module load r
+        mkdir -p {output.outdir} {params.temp_dir}
+        
+        awk '{{print $0}}' {input.prep_files} > {params.prep_all}
+        
+        if (( "$(wc -l < {input.prep_files})"  <= 2  ))
+        then
+        echo 'No beta-diversity reported for this run, as there is less than three samples.' > {log}
+        exit 0
+        fi
+        
+        simka -in {params.prep_all} -out {output.outdir}/output {params.extra_params} -max-reads {params.max_reads} \
+        -max-memory {resources.mem_mb} -nb-cores {threads} -out-tmp {params.temp_dir} | tee -a {log}
+
+        rm -r {output.outdir}/figures &> /dev/null || true 
+        python {params.makefigs} -in {output.outdir}/output -out {output.outdir}/figures {params.figure_params}
+        
+        pigz {output.outdir}/figures/*
+        """
+
+rule kraken2:
+    input:
+        read1=ancient(rules.fastp.output.trim1)
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low'),
+        time= '36:00:00'
+    threads: get_threads()
+    conda: "kraken"
+    output:
+        k_file = f"{out_name}/{{group}}/02_diversity/kraken2/{{sample}}.kraken2",
+        k_report = f"{out_name}/{{group}}/02_diversity/kraken2/{{sample}}.k2"
+    params:
+        KRAKEN_DB = config['kraken']['kraken_db']
+    shell:
+        """
+        kraken2 --output {output.k_file} --gzip-compressed  --report {output.k_report}\
+        --threads {threads} -db {params.KRAKEN_DB} {input.read1}
+        """
+
+rule bracken:
+    input:
+        k_file=ancient(rules.kraken2.output.k_file),
+        k_report=ancient(rules.kraken2.output.k_report)
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low'),
+        time = '36:00:00'
+    output: f"{out_name}/{{group}}/02_diversity/kraken2/{{sample}}.blog"
+    conda: "kraken"
+    params:
+        KRAKEN_DB = config['kraken']['kraken_db'],
+        levels = config['bracken']['levels'],
+        out_prefix = f"{out_name}/{{group}}/02_diversity/kraken2/{{sample}}"
+    shell:"""
+    for level in {params.levels}
+    do
+
+    bracken -d {params.KRAKEN_DB} \
+    -i {input.k_report} -o {params.out_prefix}_${{level}}.bracken -r 150 -l ${{level}} \
+    -w {params.out_prefix}_${{level}}.breport >> {output[0]} 
+
+    kreport2krona.py -r {params.out_prefix}_${{level}}.breport -o {params.out_prefix}_${{level}}.b.krona.txt
+    
+
+    done
+    """
+
+def krona_input(wildcards):
+    kr_list = []
+    for item_s in [expand(f"{out_name}/{{group}}/02_diversity/kraken2/{{sample}}_{{level}}.b.krona.txt",sample=key,group=wildcards.group,
+        level=config['bracken']['levels'].split()) for key in samples_in_group[wildcards.group]]:
+        kr_list.extend(item_s)
+    return kr_list
+
+rule krona_plot:
+    input:
+        ancient(lambda wildcards: expand(f"{out_name}/{{group}}/02_diversity/kraken2/{{sample}}.blog",
+            group=wildcards.group,sample=samples_in_group[wildcards.group]))
+    output:
+        f"{out_name}/{{group}}/02_diversity/kraken2/diversity_krona.html"
+    conda: "kraken"
+    threads: get_threads('low')
+    resources:
+        mem_per_cpu=get_mem_cpu('low'),
+        mem_mb=get_mem_mb(mem_level='low',thread_level='low')
+    params:
+        input_files = lambda wildcards: krona_input(wildcards)
+    shell:
+        """
+        ktImportText {params.input_files} -o {output} 
+        """
+
+
+
